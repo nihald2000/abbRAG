@@ -1,173 +1,126 @@
 import chromadb
 from chromadb.utils import embedding_functions
 import ollama
-from typing import List, Dict
 
-class Retriever:
-    def __init__(self, collection_name="log_chunks"):
-        # Initialize ChromaDB client
-        self.client = chromadb.Client()
-        
-        # Use lightweight embedding model for CPU
-        self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
-        )
-        
-        # Get or create collection
-        try:
-            self.collection = self.client.get_collection(
-                name=collection_name,
-                embedding_function=self.embedding_fn
-            )
-        except:
-            self.collection = self.client.create_collection(
-                name=collection_name,
-                embedding_function=self.embedding_fn
-            )
+# 1. Initialize and get ChromaDB collection
+def get_chromadb_collection(collection_name="log_chunks"):
+    """
+    Initialize ChromaDB and return collection
+    """
+    client = chromadb.Client()
     
-    def retrieve(self, query: str, n_results: int = 5, filters: Dict = None):
-        """
-        Retrieve relevant chunks from ChromaDB
-        
-        Args:
-            query: User's search query
-            n_results: Number of chunks to retrieve
-            filters: Optional metadata filters
-        
-        Returns:
-            Dictionary with documents and metadata
-        """
-        # Basic retrieval
-        if filters is None:
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=n_results
-            )
+    embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="all-MiniLM-L6-v2"
+    )
+    
+    try:
+        collection = client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_fn
+        )
+    except:
+        collection = client.create_collection(
+            name=collection_name,
+            embedding_function=embedding_fn
+        )
+    
+    return collection
+
+# 2. Retrieve relevant chunks from ChromaDB
+def retrieve_from_chromadb(query, n_results=5, collection=None):
+    """
+    Retrieve relevant chunks based on query
+    
+    Args:
+        query: User's search query
+        n_results: Number of chunks to retrieve
+        collection: ChromaDB collection (if None, creates new)
+    
+    Returns:
+        dict with documents, metadatas, and distances
+    """
+    if collection is None:
+        collection = get_chromadb_collection()
+    
+    results = collection.query(
+        query_texts=[query],
+        n_results=n_results
+    )
+    
+    return {
+        "documents": results['documents'][0] if results['documents'] else [],
+        "metadatas": results['metadatas'][0] if results['metadatas'] else [],
+        "distances": results['distances'][0] if results['distances'] else []
+    }
+
+# 3. Generate response using retrieved chunks and Ollama
+def generate_response_with_ollama(query, retrieved_chunks, model="llama2"):
+    """
+    Generate response using Ollama Llama2 based on retrieved chunks
+    
+    Args:
+        query: User's question
+        retrieved_chunks: Dict with documents and metadatas from retrieval
+        model: Ollama model name
+    
+    Returns:
+        Generated response string
+    """
+    # Prepare context from retrieved chunks
+    contexts = retrieved_chunks.get("documents", [])
+    metadatas = retrieved_chunks.get("metadatas", [])
+    
+    # Format context with metadata
+    formatted_context = ""
+    for i, (chunk, metadata) in enumerate(zip(contexts, metadatas)):
+        if metadata:
+            source = metadata.get('source_file', 'unknown')
+            time_range = f"{metadata.get('start_time', 'N/A')} - {metadata.get('end_time', 'N/A')}"
+            formatted_context += f"[Chunk {i+1} | Source: {source} | Time: {time_range}]\n{chunk}\n\n"
         else:
-            # Retrieval with metadata filtering
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=n_results,
-                where=filters
-            )
-        
-        return {
-            "documents": results['documents'][0] if results['documents'] else [],
-            "metadatas": results['metadatas'][0] if results['metadatas'] else [],
-            "distances": results['distances'][0] if results['distances'] else []
-        }
-
-class ResponseGenerator:
-    def __init__(self, model_name="llama2"):
-        self.model_name = model_name
-        
-    def generate(self, query: str, contexts: List[str], metadatas: List[Dict] = None):
-        """
-        Generate response using Ollama Llama2
-        
-        Args:
-            query: User's question
-            contexts: Retrieved log chunks
-            metadatas: Optional metadata for each chunk
-        
-        Returns:
-            Generated response
-        """
-        # Prepare context with metadata if available
-        if metadatas:
-            formatted_contexts = []
-            for i, (context, metadata) in enumerate(zip(contexts, metadatas)):
-                meta_str = f"[Source: {metadata.get('source_file', 'unknown')}, " \
-                          f"Time: {metadata.get('start_time', 'N/A')} - {metadata.get('end_time', 'N/A')}]"
-                formatted_contexts.append(f"{meta_str}\n{context}")
-            context_text = "\n\n---\n\n".join(formatted_contexts)
-        else:
-            context_text = "\n\n---\n\n".join(contexts)
-        
-        # Create prompt
-        prompt = f"""You are analyzing system logs to help answer questions. Based on the retrieved log data below, provide a detailed and accurate answer to the user's question.
-
-Retrieved Log Data:
-{context_text}
-
-User Question: {query}
-
-Instructions:
-1. Analyze the log patterns and extract relevant information
-2. If you notice any errors or warnings, highlight them
-3. Provide specific details from the logs (timestamps, endpoints, status codes, etc.)
-4. If the logs don't contain enough information to fully answer the question, state what's missing
-
-Answer:"""
-
-        # Generate response using Ollama
-        response = ollama.chat(
-            model=self.model_name,
-            messages=[
-                {
-                    'role': 'system',
-                    'content': 'You are a helpful log analysis assistant. Provide detailed answers based on the log data provided.'
-                },
-                {
-                    'role': 'user',
-                    'content': prompt
-                }
-            ],
-            options={
-                'temperature': 0.2,  # Lower temperature for more factual responses
-                'num_predict': 500,  # Limit response length
-            }
-        )
-        
-        return response['message']['content']
-
-class LogRAGSystem:
-    def __init__(self):
-        self.retriever = Retriever()
-        self.generator = ResponseGenerator()
+            formatted_context += f"[Chunk {i+1}]\n{chunk}\n\n"
     
-    def query(self, 
-              user_query: str, 
-              n_chunks: int = 5,
-              filters: Dict = None):
-        """
-        Main query interface for the RAG system
-        
-        Args:
-            user_query: User's question about the logs
-            n_chunks: Number of chunks to retrieve
-            filters: Optional filters (e.g., {'log_level': 'ERROR'})
-        
-        Returns:
-            Dictionary with response and sources
-        """
-        # Step 1: Retrieve relevant chunks
-        retrieval_results = self.retriever.retrieve(
-            query=user_query,
-            n_results=n_chunks,
-            filters=filters
-        )
-        
-        if not retrieval_results['documents']:
-            return {
-                "response": "No relevant log data found for your query.",
-                "sources": [],
-                "chunks_used": 0
-            }
-        
-        # Step 2: Generate response
-        response = self.generator.generate(
-            query=user_query,
-            contexts=retrieval_results['documents'],
-            metadatas=retrieval_results['metadatas']
-        )
-        
-        return {
-            "response": response,
-            "sources": retrieval_results['metadatas'],
-            "chunks_used": len(retrieval_results['documents']),
-            "relevance_scores": retrieval_results['distances']
-        }
+    # Create prompt
+    prompt = f"""Based on the following log data, answer the user's question accurately.
 
+LOG DATA:
+{formatted_context}
+
+USER QUESTION: {query}
+
+Provide a detailed answer based only on the log information above. If you find errors, warnings, or patterns, highlight them."""
+
+    # Generate response
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {
+                'role': 'user',
+                'content': prompt
+            }
+        ],
+        options={
+            'temperature': 0.2,
+            'num_predict': 500,
+        }
+    )
     
-        
+    return response['message']['content']
+
+# Simple usage example:
+if __name__ == "__main__":
+    # Example query
+    user_query = "What errors occurred in the angular application?"
+    
+    # Step 1: Get collection
+    collection = get_chromadb_collection()
+    
+    # Step 2: Retrieve relevant chunks
+    retrieved = retrieve_from_chromadb(user_query, n_results=5, collection=collection)
+    
+    # Step 3: Generate response
+    response = generate_response_with_ollama(user_query, retrieved)
+    
+    print(f"Query: {user_query}")
+    print(f"Response: {response}")
+    print(f"Based on {len(retrieved['documents'])} chunks")
