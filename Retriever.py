@@ -1,126 +1,80 @@
-import chromadb
-from chromadb.utils import embedding_functions
-import ollama
+# rag_query.py
+import argparse
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.llms import Ollama
+from langchain import PromptTemplate, LLMChain
+from langchain.chains import RetrievalQA
 
-# 1. Initialize and get ChromaDB collection
-def get_chromadb_collection(collection_name="log_chunks"):
-    """
-    Initialize ChromaDB and return collection
-    """
-    client = chromadb.Client()
-    
-    embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
+def main(args):
+    # 1️⃣ Load the persisted vector store
+    embeddings = OllamaEmbeddings(
+        model=args.embedding_model,
+        base_url="http://localhost:11434",
     )
-    
-    try:
-        collection = client.get_collection(
-            name=collection_name,
-            embedding_function=embedding_fn
-        )
-    except:
-        collection = client.create_collection(
-            name=collection_name,
-            embedding_function=embedding_fn
-        )
-    
-    return collection
-
-# 2. Retrieve relevant chunks from ChromaDB
-def retrieve_from_chromadb(query, n_results=5, collection=None):
-    """
-    Retrieve relevant chunks based on query
-    
-    Args:
-        query: User's search query
-        n_results: Number of chunks to retrieve
-        collection: ChromaDB collection (if None, creates new)
-    
-    Returns:
-        dict with documents, metadatas, and distances
-    """
-    if collection is None:
-        collection = get_chromadb_collection()
-    
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results
+    db = Chroma(
+        collection_name=args.collection_name,
+        embedding_function=embeddings,
+        persist_directory=args.persist_dir,
     )
-    
-    return {
-        "documents": results['documents'][0] if results['documents'] else [],
-        "metadatas": results['metadatas'][0] if results['metadatas'] else [],
-        "distances": results['distances'][0] if results['distances'] else []
-    }
 
-# 3. Generate response using retrieved chunks and Ollama
-def generate_response_with_ollama(query, retrieved_chunks, model="llama2"):
+    # 2️⃣ Set up the retriever (you can tweak k=4 to return more/less docs)
+    retriever = db.as_retriever(search_kwargs={"k": args.k})
+
+    # 3️⃣ Load the generative LLM (the same or a different model)
+    llm = Ollama(
+        model=args.gen_model,
+        base_url="http://localhost:11434",
+        temperature=args.temperature,
+    )
+
+    # 4️⃣ Prompt template – feel free to edit
+    template = """
+    Use the following context (delimited by <ctx> and </ctx>) to answer the question.
+    If the answer is not in the context, say "I don't have that information."
+
+    <ctx>
+    {context}
+    </ctx>
+
+    Question: {question}
+    Answer (concise, friendly):
     """
-    Generate response using Ollama Llama2 based on retrieved chunks
-    
-    Args:
-        query: User's question
-        retrieved_chunks: Dict with documents and metadatas from retrieval
-        model: Ollama model name
-    
-    Returns:
-        Generated response string
-    """
-    # Prepare context from retrieved chunks
-    contexts = retrieved_chunks.get("documents", [])
-    metadatas = retrieved_chunks.get("metadatas", [])
-    
-    # Format context with metadata
-    formatted_context = ""
-    for i, (chunk, metadata) in enumerate(zip(contexts, metadatas)):
-        if metadata:
-            source = metadata.get('source_file', 'unknown')
-            time_range = f"{metadata.get('start_time', 'N/A')} - {metadata.get('end_time', 'N/A')}"
-            formatted_context += f"[Chunk {i+1} | Source: {source} | Time: {time_range}]\n{chunk}\n\n"
+    prompt = PromptTemplate.from_template(template)
+
+    # 5️⃣ Build the QA chain
+    qa = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=True,
+        chain_type_kwargs={"prompt": prompt},
+    )
+
+    # 6️⃣ Interactive loop
+    while True:
+        query = input("\nQuery (or type 'exit'): ").strip()
+        if query.lower() in {"exit", "quit"}:
+            break
+        result = qa({"question": query})
+        answer = result["answer"]
+        sources = result["source_documents"]
+        print("\n=== ANSWER ===")
+        print(answer)
+        if sources:
+            print("\n=== SOURCES ===")
+            for i, doc in enumerate(sources, 1):
+                print(f"{i}. {doc.metadata.get('source', 'unknown')}")
         else:
-            formatted_context += f"[Chunk {i+1}]\n{chunk}\n\n"
-    
-    # Create prompt
-    prompt = f"""Based on the following log data, answer the user's question accurately.
+            print("\n(no sources found)")
 
-LOG DATA:
-{formatted_context}
-
-USER QUESTION: {query}
-
-Provide a detailed answer based only on the log information above. If you find errors, warnings, or patterns, highlight them."""
-
-    # Generate response
-    response = ollama.chat(
-        model=model,
-        messages=[
-            {
-                'role': 'user',
-                'content': prompt
-            }
-        ],
-        options={
-            'temperature': 0.2,
-            'num_predict': 500,
-        }
-    )
-    
-    return response['message']['content']
-
-# Simple usage example:
 if __name__ == "__main__":
-    # Example query
-    user_query = "What errors occurred in the angular application?"
-    
-    # Step 1: Get collection
-    collection = get_chromadb_collection()
-    
-    # Step 2: Retrieve relevant chunks
-    retrieved = retrieve_from_chromadb(user_query, n_results=5, collection=collection)
-    
-    # Step 3: Generate response
-    response = generate_response_with_ollama(user_query, retrieved)
-    
-    print(f"Query: {user_query}")
-    print(f"Response: {response}")
-    print(f"Based on {len(retrieved['documents'])} chunks")
+    parser = argparse.ArgumentParser(description="Query a RAG index built with Ollama")
+    parser.add_argument("--persist_dir", default="./chroma_db", help="Directory of the Chroma DB")
+    parser.add_argument("--collection_name", default="rag", help="Chroma collection name")
+    parser.add_argument("--embedding_model", default="llama3", help="Model for embeddings")
+    parser.add_argument("--gen_model", default="llama3", help="Model for generation")
+    parser.add_argument("-k", type=int, default=4, help="Number of docs to retrieve")
+    parser.add_argument("--temperature", type=float, default=0.7, help="LLM temperature")
+    args = parser.parse_args()
+    main(args)
